@@ -254,7 +254,11 @@ def get_stats(container):
 
 def get_containers(names, require_present):
     containers_list, _ = get_url(daemon + '/containers/json?all=1')
-    all_container_names = set(x['Names'][0][1:] for x in containers_list)
+
+    all_container_ids = set(x['Id'] for x in containers_list)
+
+    # This extra lookup get the actual named displayed by 'docker ps' when used with linked containers.
+    all_container_names = set(get_container_info(id)['Name'][1:] for id in all_container_ids)
     if 'all' in names:
         return all_container_names
 
