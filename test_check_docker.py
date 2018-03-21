@@ -335,12 +335,22 @@ def test_check_uptime1(monkeypatch, check_docker, uptime, warn, crit, exspected_
     assert check_docker.rc == exspected_status
 
 
+sample_containers = {
+    'id1': '/name1',
+    'id2': '/name2'}
+
+
 @pytest.fixture
 def sample_containers_json():
-    return [
-        {'Names': ['/thing1']},
-        {'Names': ['/thing2']}
-    ]
+    return [{'Id': id} for id in sample_containers.keys()]
+
+
+@pytest.fixture
+def mock_get_container_info():
+    def mock(id):
+        return {'Name': sample_containers[id]}
+
+    return mock
 
 
 def test_args_help(check_docker, capsys):
@@ -471,31 +481,35 @@ def test_present_check(check_docker):
     assert not check_docker.no_checks_present(result)
 
 
-def test_get_containers_1(check_docker, sample_containers_json):
+def test_get_containers_1(check_docker, monkeypatch, sample_containers_json, mock_get_container_info):
     with patch('check_docker.get_url', return_value=(sample_containers_json, 200)):
+        monkeypatch.setattr(check_docker, 'get_container_info', value=mock_get_container_info)
         container_list = check_docker.get_containers('all', False)
-        assert container_list == {'thing1', 'thing2'}
+        assert container_list == {'name1', 'name2'}
 
 
-def test_get_containers_2(check_docker, sample_containers_json):
+def test_get_containers_2(check_docker, monkeypatch, sample_containers_json, mock_get_container_info):
     with patch('check_docker.get_url', return_value=(sample_containers_json, 200)):
-        container_list = check_docker.get_containers(['thing.*'], False)
-        assert container_list == {'thing1', 'thing2'}
+        monkeypatch.setattr(check_docker, 'get_container_info', value=mock_get_container_info)
+        container_list = check_docker.get_containers(['name.*'], False)
+        assert container_list == {'name1', 'name2'}
 
 
-def test_get_containers_3(check_docker, sample_containers_json):
+def test_get_containers_3(check_docker, monkeypatch, sample_containers_json, mock_get_container_info):
     check_docker.rc = -1
     with patch('check_docker.get_url', return_value=(sample_containers_json, 200)):
         with patch('check_docker.unknown') as patched:
+            monkeypatch.setattr(check_docker, 'get_container_info', value=mock_get_container_info)
             container_list = check_docker.get_containers({'foo'}, False)
             assert container_list == set()
             assert patched.call_count == 0
 
 
-def test_get_containers_4(check_docker, sample_containers_json):
+def test_get_containers_4(check_docker, monkeypatch, sample_containers_json, mock_get_container_info):
     check_docker.rc = -1
     with patch('check_docker.get_url', return_value=(sample_containers_json, 200)):
         with patch('check_docker.critical') as patched:
+            monkeypatch.setattr(check_docker, 'get_container_info', value=mock_get_container_info)
             container_list = check_docker.get_containers({'foo'}, True)
             assert container_list == set()
             assert patched.call_count == 1
@@ -563,7 +577,7 @@ def test_perform_with_no_containers(check_docker, fs):
 ))
 def test_perform(check_docker, fs, args, called):
     fs.CreateFile(check_docker.DEFAULT_SOCKET, contents='', st_mode=(stat.S_IFSOCK | 0o666))
-    with patch('check_docker.get_url', return_value=([{'Names': ['/thing1']}, ], 200)):
+    with patch('check_docker.get_containers', return_value=['thing1']):
         with patch(called) as patched:
             check_docker.perform_checks(args)
             assert patched.call_count == 1
