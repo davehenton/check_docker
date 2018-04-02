@@ -171,9 +171,8 @@ def parse_thresholds(spec, include_units=True, units_required=True):
 
 def evaluate_numeric_thresholds(container, value, warn, crit, name, short_name, min=None, max=None, units='',
                                 greater_than=True):
-
     # Some units don't have decimal places
-    rounded_value = int(value) if units in ['B','%', None] else round(value, 2)
+    rounded_value = int(value) if units in ['B', '%', None] else round(value, 2)
 
     perf_string = "{}_{}={}{};{};{}".format(container, short_name, rounded_value, units, warn, crit)
     if min is not None:
@@ -199,22 +198,31 @@ def evaluate_numeric_thresholds(container, value, warn, crit, name, short_name, 
             ok("{} {} is {}{}".format(container, name, rounded_value, units))
 
 
-@lru_cache()
+@lru_cache(maxsize=None)
 def get_url(url):
     response = better_urllib_get.open(url, timeout=timeout)
     return process_urllib_response(response), response.status
 
 
-@lru_cache()
+@lru_cache(maxsize=None)
 def head_url(url, auth_token=None):
     if auth_token:
         better_urllib_head.addheaders.append(('Authorization', 'Bearer ' + auth_token))
-    # Follow redirects
-    response = better_urllib_head.open(url, timeout=timeout)
-    if auth_token:
-        better_urllib_head.addheaders.pop()
-    return response
 
+    # Turns out exceptions are not cached. To address this I cheat and handle it here rather that in the caller
+    # where it would be easier to see what is going on.
+    try:
+        # Follow redirects
+        response = better_urllib_head.open(url, timeout=timeout)
+        if auth_token:
+            better_urllib_head.addheaders.pop()
+        return response
+    # Convert unauthorized response to regular response
+    except HTTPError as e:
+        if e.code == 401:
+            return e.fp
+        else:
+            raise e
 
 def process_urllib_response(response):
     response_bytes = response.read()
@@ -233,7 +241,6 @@ def get_image_info(name):
     return content
 
 
-@lru_cache()
 def get_manifest_auth_token(www_authenticate_header):
     # TODO: Pass the error on to be handled better
     assert 'Bearer realm=' in www_authenticate_header, "Auth header is not one I can process"
@@ -252,13 +259,20 @@ def get_stats(container):
     return content
 
 
+def get_ps_name(name_list):
+    # Pick the name that starts with a '/' and return that value without the '/'
+    for name in name_list:
+        if name[0] == '/':
+            return name[1:]
+    else:
+        raise Exception("Error when trying to identify 'ps' name in {}".format(name_list))
+
+
 def get_containers(names, require_present):
     containers_list, _ = get_url(daemon + '/containers/json?all=1')
 
-    all_container_ids = set(x['Id'] for x in containers_list)
+    all_container_names = set(get_ps_name(x['Names']) for x in containers_list)
 
-    # This extra lookup get the actual named displayed by 'docker ps' when used with linked containers.
-    all_container_names = set(get_container_info(id)['Name'][1:] for id in all_container_ids)
     if 'all' in names:
         return all_container_names
 
@@ -310,13 +324,7 @@ def normalize_image_name_to_manifest_url(image_name, insecure_registries):
 
 def get_digest_from_registry(url):
     # query registry
-    try:
-        registry_info = head_url(url=url)
-    except HTTPError as e:
-        if e.code == 401:  # Convert unauthorized response to regular response
-            registry_info = e.fp
-        else:
-            raise e
+    registry_info = head_url(url, None)
 
     if registry_info.status == 401:  # HTTP unauthorized
 
@@ -327,9 +335,10 @@ def get_digest_from_registry(url):
         token = get_manifest_auth_token(www_authenticate_header)
 
         # query registry again
-        registry_info = head_url(url=url, auth_token=token)
+        registry_info = head_url(url, token)
 
     registry_hash = registry_info.getheader('Docker-Content-Digest', None)
+
     return registry_hash
 
 
@@ -516,11 +525,18 @@ def check_version(container, insecure_registries):
     try:
         registry_hash = get_digest_from_registry(url)
     except URLError as e:
-        if e.reason.reason == 'UNKNOWN_PROTOCOL':
+        if hasattr(e.reason, 'reason') and e.reason.reason == 'UNKNOWN_PROTOCOL':
             unknown(
                 "TLS error connecting to registry {} for {}, should you use the '--insecure-registry' flag?" \
                     .format(registry, container))
             return
+        elif hasattr(e.reason, 'strerror') and e.reason.strerror == 'nodename nor servname provided, or not known':
+            unknown(
+                "Cannot reach registry for {}" \
+                    .format(container, url))
+            return
+        else:
+            raise e
 
     if registry_hash is None:
         unknown("Cannot check version, Registry didn't return 'Docker-Content-Digest header for {} while checking {}." \

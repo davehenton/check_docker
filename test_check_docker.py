@@ -335,14 +335,14 @@ def test_check_uptime1(monkeypatch, check_docker, uptime, warn, crit, exspected_
     assert check_docker.rc == exspected_status
 
 
-sample_containers = {
-    'id1': '/name1',
-    'id2': '/name2'}
+sample_containers = [
+    {'Names': ['/name1']},
+    {'Names': ['/name2']}]
 
 
 @pytest.fixture
 def sample_containers_json():
-    return [{'Id': id} for id in sample_containers.keys()]
+    return sample_containers
 
 
 @pytest.fixture
