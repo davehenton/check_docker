@@ -209,8 +209,7 @@ def head_url(url, auth_token=None):
     if auth_token:
         better_urllib_head.addheaders.append(('Authorization', 'Bearer ' + auth_token))
 
-    # Turns out exceptions are not cached. To address this I cheat and handle it here rather that in the caller
-    # where it would be easier to see what is going on.
+    # Turns out exceptions are not cached so I covert it back to regular response
     try:
         # Follow redirects
         response = better_urllib_head.open(url, timeout=timeout)
@@ -323,8 +322,9 @@ def normalize_image_name_to_manifest_url(image_name, insecure_registries):
 
 
 def get_digest_from_registry(url):
+
     # query registry
-    registry_info = head_url(url, None)
+    registry_info = head_url(url=url)
 
     if registry_info.status == 401:  # HTTP unauthorized
 
@@ -335,7 +335,7 @@ def get_digest_from_registry(url):
         token = get_manifest_auth_token(www_authenticate_header)
 
         # query registry again
-        registry_info = head_url(url, token)
+        registry_info = head_url(url=url, auth_token=token)
 
     registry_hash = registry_info.getheader('Docker-Content-Digest', None)
 
