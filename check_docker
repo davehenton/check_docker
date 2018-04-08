@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-from concurrent import futures
+import argparse
+import json
+import logging
 import os
+import re
+import socket
 import stat
 import traceback
 from collections import deque, namedtuple
+from concurrent import futures
 from datetime import datetime, timezone
-import logging
-from sys import argv
+from functools import lru_cache
 from http.client import HTTPConnection
-from time import sleep
+from sys import argv
 from urllib.error import HTTPError, URLError
 from urllib.request import AbstractHTTPHandler, HTTPHandler, HTTPSHandler, OpenerDirector, HTTPRedirectHandler, Request, \
     HTTPDefaultErrorHandler, HTTPErrorProcessor
-import argparse
-import json
-import socket
-from functools import lru_cache
-import re
 
+# logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger()
 __author__ = 'Tim Laurence'
 __copyright__ = "Copyright 2018"
@@ -67,9 +67,10 @@ ImageName = namedtuple('ImageName', "registry name tag full_name")
 
 # How much threading can we do? We are generally not CPU bound so I am using this a worse case cap
 try:
-    parallelism = len(os.sched_getaffinity(0))
+    parallelism = len(os.sched_getaffinity(0)) * 4
 except Exception:
-    parallelism = os.cpu_count()
+    parallelism = os.cpu_count() * 4
+
 
 # Hacked up urllib to handle sockets
 #############################################################################################
@@ -141,6 +142,11 @@ better_urllib_head.add_handler(HTTPErrorProcessor())
 better_urllib_head.add_handler(SocketFileHandler())
 
 
+class RegistryError(Exception):
+    def __init__(self, response):
+        self.response_obj = response
+
+
 # Util functions
 #############################################################################################
 def parse_thresholds(spec, include_units=True, units_required=True):
@@ -207,33 +213,42 @@ def evaluate_numeric_thresholds(container, value, warn, crit, name, short_name, 
 
 @lru_cache(maxsize=None)
 def get_url(url):
+    logger.debug("get_url: {}".format(url))
     response = better_urllib_get.open(url, timeout=timeout)
+    logger.debug("get_url: {} {}".format(url, response.status))
     return process_urllib_response(response), response.status
 
 
 @lru_cache(maxsize=None)
 def head_url(url, auth_token=None):
-    if auth_token:
-        better_urllib_head.addheaders.append(('Authorization', 'Bearer ' + auth_token))
+    logger.debug("head_url: {} {}".format(url, auth_token))
 
     # Turns out exceptions are not cached so I covert it back to regular response
     try:
+        if auth_token:
+            better_urllib_head.addheaders.append(('Authorization', 'Bearer ' + auth_token))
+
         # Follow redirects
         response = better_urllib_head.open(url, timeout=timeout)
-        if auth_token:
-            better_urllib_head.addheaders.pop()
-        return response
+
     # Convert unauthorized response to regular response
     except HTTPError as e:
         if e.code == 401:
-            return e.fp
+            response = e.fp
         else:
             raise e
+    finally:
+        if auth_token:
+            better_urllib_head.addheaders.pop()
+
+    logger.debug("{} {} {}".format(url, auth_token, response.status))
+    return response
+
 
 def process_urllib_response(response):
     response_bytes = response.read()
     body = response_bytes.decode('utf-8')
-    logger.debug(body)
+    # logger.debug("BODY: {}".format(body))
     return json.loads(body)
 
 
@@ -248,11 +263,27 @@ def get_image_info(name):
 
 
 def get_manifest_auth_token(www_authenticate_header):
-    # TODO: Pass the error on to be handled better
-    assert 'Bearer realm=' in www_authenticate_header, "Auth header is not one I can process"
-    header_list = www_authenticate_header.replace('Bearer realm=', '').replace('"', '').split(',')
-    auth_url = header_list[0] + '?' + '&'.join(header_list[1:])
+    logger.debug("www_authenticate_header: {}".format(www_authenticate_header))
+
+    # This is the doc on how to do the properly but rather than spend a week doing it by the book
+    # I'm using a quick and dirty method and seeing if it works.
+    #   https://tools.ietf.org/html/rfc6750#section-3
+    #   https://tools.ietf.org/html/rfc7230#section-3.2
+    #
+    # Here is where I found the hack
+    # https://stackoverflow.com/questions/1349367/parse-an-http-request-authorization-header-with-python
+    auth_fields = dict(re.findall(r"""(?:(?P<key>[^ ,=]+)="([^"]+)")""", www_authenticate_header))
+
+    auth_url = "{realm}?scope={scope}&service={service}".format(
+        realm=auth_fields['realm'],
+        scope=auth_fields['scope'],
+        service=auth_fields['service'],
+    )
+
+    realm = auth_fields['realm']
+
     response, _ = get_url(auth_url)
+
     return response['token']
 
 
@@ -271,7 +302,7 @@ def get_ps_name(name_list):
         if name[0] == '/':
             return name[1:]
     else:
-        raise Exception("Error when trying to identify 'ps' name in {}".format(name_list))
+        raise NameError("Error when trying to identify 'ps' name in {}".format(name_list))
 
 
 def get_containers(names, require_present):
@@ -328,29 +359,27 @@ def normalize_image_name_to_manifest_url(image_name, insecure_registries):
     return url, parsed_url.registry
 
 
+# Auth servers seem picky about being hit too hard. Can't figure out why. ;)
+# As result it is best to single thread this check
+# This is based on https://docs.docker.com/registry/spec/auth/token/#requesting-a-token
 def get_digest_from_registry(url):
-
+    logger.debug("get_digest_from_registry")
     # query registry
     registry_info = head_url(url=url)
-
     if registry_info.status == 401:  # HTTP unauthorized
-        print(url)
+        logger.debug("get_digest_from_registry: {}".format(url))
         # Find auth server
         # TODO: Handle logging in if needed
         www_authenticate_header = registry_info.headers.get('Www-Authenticate')
         # Get auth token
         token = get_manifest_auth_token(www_authenticate_header)
-
         # query registry again
         registry_info = head_url(url=url, auth_token=token)
 
-    if registry_info.status == 401:
-        _ = 1
-        pass
-    print(url, registry_info.status)
-    registry_hash = registry_info.getheader('Docker-Content-Digest', None)
-
-    return registry_hash
+    digest = registry_info.getheader('Docker-Content-Digest', None)
+    if digest is None:
+        raise RegistryError(response=registry_info)
+    return digest
 
 
 def set_rc(new_rc):
@@ -543,16 +572,14 @@ def check_version(container, insecure_registries):
             return
         elif hasattr(e.reason, 'strerror') and e.reason.strerror == 'nodename nor servname provided, or not known':
             unknown(
-                "Cannot reach registry for {}" \
-                    .format(container, url))
+                "Cannot reach registry for {} at {}".format(container, url))
             return
         else:
             raise e
-
-    if registry_hash is None:
-        unknown("Cannot check version, Registry didn't return 'Docker-Content-Digest header for {} while checking {}." \
-                .format(container, url))
+    except RegistryError as e:
+        unknown("Cannot check version, couldn't retrieve digest for {} while checking {}.".format(container, url))
         return
+
     if registry_hash == image_digest:
         ok("{}'s version matches registry".format(container))
         return
@@ -775,36 +802,6 @@ def print_results():
     else:
         print(messages_concat)
 
-def container_check_thread(args, container):
-    # Check status
-    if args.status:
-        check_status(container, args.status)
-
-    # Check version
-    if args.version:
-        check_version(container, args.insecure_registries)
-
-    # below are checks that require a 'running' status
-
-    # Check status
-    if args.health:
-        check_health(container)
-
-    # Check cpu usage
-    if args.cpu:
-        check_cpu(container, *parse_thresholds(args.cpu, units_required=False))
-
-    # Check memory usage
-    if args.memory:
-        check_memory(container, *parse_thresholds(args.memory, units_required=False))
-
-    # Check uptime
-    if args.uptime:
-        check_uptime(container, *parse_thresholds(args.uptime, include_units=False))
-
-    # Check restart count
-    if args.restarts:
-        check_restarts(container, *parse_thresholds(args.restarts, include_units=False))
 
 def perform_checks(raw_args):
     args = process_args(raw_args)
@@ -819,20 +816,59 @@ def perform_checks(raw_args):
     else:
         # Here is where all the work happens
         #############################################################################################
+        try:
             containers = get_containers(args.containers, args.present)
 
             if len(containers) == 0:
                 unknown("No containers names found matching criteria")
             else:
-                try:
-                    # We can use a with statement to ensure threads are cleaned up promptly
-                    with futures.ThreadPoolExecutor(max_workers=parallelism) as executor:
-                        # Start the load operations and mark each future with its URL
-                        check_threads = [executor.submit(container_check_thread, args, container) for container in containers]
-                        futures.as_completed(check_threads)
-                except Exception as e:
-                    traceback.print_exc()
-                    unknown("Exception raised during check': {}".format(repr(e)))
+                threads = []
+                # We can use a with statement to ensure threads are cleaned up promptly
+                with futures.ThreadPoolExecutor(max_workers=parallelism) as parallel_executor, \
+                        futures.ThreadPoolExecutor(max_workers=1) as serial_executor:
+                    for container in containers:
+
+                        # Check status
+                        if args.status:
+                            threads.append(parallel_executor.submit(check_status, container, args.status))
+
+                        # Check version
+                        if args.version:
+                            threads.append(serial_executor.submit(check_version, container, args.insecure_registries))
+
+                        # below are checks that require a 'running' status
+
+                        # Check status
+                        if args.health:
+                            threads.append(parallel_executor.submit(check_health, container))
+
+                        # Check cpu usage
+                        if args.cpu:
+                            threads.append(parallel_executor.submit(check_cpu, container,
+                                                                    *parse_thresholds(args.cpu, units_required=False)))
+
+                        # Check memory usage
+                        if args.memory:
+                            threads.append(parallel_executor.submit(check_memory, container,
+                                                                    *parse_thresholds(args.memory,
+                                                                                      units_required=False)))
+
+                        # Check uptime
+                        if args.uptime:
+                            threads.append(parallel_executor.submit(check_uptime, container,
+                                                                    *parse_thresholds(args.uptime,
+                                                                                      include_units=False)))
+
+                        # Check restart count
+                        if args.restarts:
+                            threads.append(parallel_executor.submit(check_restarts, container,
+                                                                    *parse_thresholds(args.restarts,
+                                                                                      include_units=False)))
+                    futures.wait(threads)
+
+        except Exception as e:
+            traceback.print_exc()
+            unknown("Exception raised during check': {}".format(repr(e)))
 
     print_results()
 

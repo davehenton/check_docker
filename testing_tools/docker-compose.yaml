@@ -1,0 +1,53 @@
+version: "3"
+services:
+  test_environment-3.7-rc:
+    build:
+      args:
+        - tag=3.7-rc-alpine
+      context: .
+      dockerfile: testing_tools/Dockerfile
+    volumes:
+      - $PWD:/src
+    working_dir: /src
+    network_mode: "none"
+    environment:
+      - isolated=true
+
+  test_environment-3.6:
+    build:
+      args:
+        - tag=3.6-alpine
+      context: .
+      dockerfile: testing_tools/Dockerfile
+    volumes:
+      - $PWD:/src
+    working_dir: /src
+    network_mode: "none"
+    environment:
+      - isolated=true
+
+  test_environment-3.5:
+    build:
+      args:
+        - tag=3.5-alpine
+      context: .
+      dockerfile: testing_tools/Dockerfile
+    volumes:
+      - $PWD:/src
+    working_dir: /src
+    network_mode: "none"
+    environment:
+      - isolated=true
+
+  test_environment-3.4:
+    build:
+      args:
+        - tag=3.4-alpine
+      context: .
+      dockerfile: testing_tools/Dockerfile
+    volumes:
+      - $PWD:/src
+    working_dir: /src
+    network_mode: "none"
+    environment:
+      - isolated=true

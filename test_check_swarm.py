@@ -5,6 +5,7 @@ import stat
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+import os
 import pytest
 from importlib.machinery import SourceFileLoader
 from urllib import request
@@ -310,12 +311,15 @@ def test_print_results(check_swarm, capsys, messages, perf_data, expected):
     assert out.strip() == expected
 
 
+@pytest.mark.skipif('isolated' in os.environ and os.environ['isolated'].lower != 'false',
+                    reason="Can not reach Python packge index when isolated")
 def test_package_present():
     req = request.Request("https://pypi.python.org/pypi?:action=doap&name=check_docker", method="HEAD")
     with request.urlopen(req) as resp:
         assert resp.getcode() == 200
 
-
+@pytest.mark.skipif('isolated' in os.environ and os.environ['isolated'].lower != 'false',
+                    reason="Can not reach Python packge index when isolated")
 def test_ensure_new_version():
     version = cs.__version__
     req = request.Request("https://pypi.python.org/pypi?:action=doap&name=check_docker&version={version}".

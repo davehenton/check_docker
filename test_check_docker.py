@@ -3,8 +3,9 @@ from io import BytesIO
 import stat
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
+import os
 import pytest
 from importlib.machinery import SourceFileLoader
 from urllib import request
@@ -15,9 +16,10 @@ __author__ = 'tim'
 
 
 class FakeHttpResponse(BytesIO):
-    def __init__(self, content, http_code, headers=None):
+    def __init__(self, content=b'', http_code=200, headers=None, method='GET'):
         self.status = http_code
         self.headers = headers if headers else {}
+        self.method = method
         super(FakeHttpResponse, self).__init__(content)
 
     def getheader(self, header, default):
@@ -56,6 +58,46 @@ def test_get_url(check_docker, monkeypatch):
     monkeypatch.setattr(check_docker.better_urllib_get, 'open', value=mock_open)
     response, _ = check_docker.get_url(url='/test')
     assert response == obj
+
+
+def test_head_url(check_docker, monkeypatch):
+    mock_response = FakeHttpResponse(content=b'', http_code=200, method='HEAD', headers={'test': 'test_value'})
+
+    def mock_open(*args, **kwargs):
+        return mock_response
+
+    monkeypatch.setattr(check_docker.better_urllib_head, 'open', value=mock_open)
+    response = check_docker.head_url(url='/test')
+    assert response.getheader('test', None) == 'test_value'
+
+
+def test_head_url_with_token(check_docker, monkeypatch):
+    mock_response = FakeHttpResponse(method='HEAD')
+
+    def mock_open(*args, **kwargs):
+        assert ('Authorization', 'Bearer test_token') in check_docker.better_urllib_head.addheaders
+        return mock_response
+
+    monkeypatch.setattr(check_docker.better_urllib_head, 'open', value=mock_open)
+    check_docker.head_url(url='/test', auth_token="test_token")
+
+
+def test_head_url_401(check_docker):
+    mock_response = FakeHttpResponse(content=b'', http_code=401, method='HEAD')
+    exception = HTTPError(code=401, fp=mock_response, url='url', msg='msg', hdrs=[])
+
+    with patch('check_docker.better_urllib_head.open', side_effect=exception):
+        response = check_docker.head_url(url='/test')
+    assert response == mock_response
+
+
+def test_head_url_500(check_docker):
+    expected_exception = HTTPError(code=500, fp=None, url='url', msg='msg', hdrs=[])
+    with patch('check_docker.better_urllib_head.open', side_effect=expected_exception):
+        try:
+            check_docker.head_url(url='/test')
+        except Exception as received_exception:
+            assert expected_exception == received_exception
 
 
 @pytest.mark.parametrize("func", [
@@ -443,7 +485,7 @@ def test_exclusive_args(check_docker, args):
 ))
 def test_units_base(check_docker, fs, arg, one_kb):
     # Assert value is driven by argprase results
-    assert check_docker.unit_adjustments is None, "unit_adjustments has no sensible default wihout knowing the base"
+    assert check_docker.unit_adjustments is None, "unit_adjustments has no sensible default without knowing the base"
 
     # Confirm default value is set
     parsed_args = check_docker.process_args([])
@@ -454,7 +496,7 @@ def test_units_base(check_docker, fs, arg, one_kb):
     assert parsed_args.units_base == one_kb, "units_base should be influenced by units flags"
 
     fs.CreateFile(check_docker.DEFAULT_SOCKET, contents='', st_mode=(stat.S_IFSOCK | 0o666))
-    with patch('check_docker.get_containers', return_value=['container1']), \
+    with patch('check_docker.get_containers', return_value=['test']), \
          patch('check_docker.get_stats',
                return_value={'memory_stats': {'limit': one_kb, 'usage': one_kb, 'stats': {'total_cache': 0}}}), \
          patch('check_docker.get_state', return_value={'Running': True}):
@@ -464,7 +506,7 @@ def test_units_base(check_docker, fs, arg, one_kb):
     assert check_docker.unit_adjustments['KB'] == one_kb
 
     # Confirm output shows unit conversion specified by arg
-    assert check_docker.performance_data == ['container1_mem=1.0KB;0;0;0;1.0']
+    assert check_docker.performance_data == ['test_mem=1.0KB;0;0;0;1.0']
 
 
 def test_missing_check(check_docker):
@@ -522,6 +564,16 @@ def test_socketfile_failure_false(check_docker, fs):
     assert not check_docker.socketfile_permissions_failure(parsed_args=result)
 
 
+def test_socketfile_failure_result(check_docker):
+    # Confirm bad socket results in uknown status
+
+    args = ('--cpu', '0:0', '--connection', '/tmp/missing')
+    with patch('check_docker.get_url', return_value=(['thing1'], 200)):
+        with patch('check_docker.unknown') as patched:
+            check_docker.perform_checks(args)
+            assert patched.call_count == 1
+
+
 def test_socketfile_failure_filetype(check_docker, fs):
     fs.CreateFile('/tmp/not_socket', contents='testing')
     args = ('--status', 'running', '--connection', '/tmp/not_socket')
@@ -532,7 +584,7 @@ def test_socketfile_failure_filetype(check_docker, fs):
 def test_socketfile_failure_missing(check_docker, fs):
     args = ('--status', 'running', '--connection', '/tmp/missing')
     result = check_docker.process_args(args=args)
-    check_docker.socketfile_permissions_failure(parsed_args=result)
+    assert check_docker.socketfile_permissions_failure(parsed_args=result)
 
 
 def test_socketfile_failure_unwriteable(check_docker, fs):
@@ -565,6 +617,16 @@ def test_perform_with_no_containers(check_docker, fs):
             assert patched.call_count == 1
 
 
+def test_perform_with_uncaught_exception(check_docker, fs):
+    fs.CreateFile(check_docker.DEFAULT_SOCKET, contents='', st_mode=(stat.S_IFSOCK | 0o666))
+    args = ['--cpu', '0:0']
+    with patch('check_docker.get_url', return_value=(['thing1'], 200)), \
+         patch('check_docker.unknown') as patched, \
+            patch('check_docker.check_cpu', side_effect=Exception("Oh no!")):
+        check_docker.perform_checks(args)
+        assert patched.call_count == 1
+
+
 @pytest.mark.parametrize("args, called", (
         (['--cpu', '0:0'], 'check_docker.check_cpu'),
         (['--memory', '0:0'], 'check_docker.check_memory'),
@@ -583,26 +645,30 @@ def test_perform(check_docker, fs, args, called):
             assert patched.call_count == 1
 
 
-@pytest.mark.parametrize("messages, perf_data, exspected", (
+@pytest.mark.parametrize("messages, perf_data, expected", (
         ([], [], ''),
         (['TEST'], [], 'TEST'),
         (['FOO', 'BAR'], [], 'FOO; BAR'),
         (['FOO', 'BAR'], ['1;2;3;4;'], 'FOO; BAR|1;2;3;4;')
 ))
-def test_print_results(check_docker, capsys, messages, perf_data, exspected):
+def test_print_results(check_docker, capsys, messages, perf_data, expected):
     check_docker.messages = messages
     check_docker.performance_data = perf_data
     check_docker.print_results()
     out, err = capsys.readouterr()
-    assert out.strip() == exspected
+    assert out.strip() == expected
 
 
+@pytest.mark.skipif('isolated' in os.environ and os.environ['isolated'].lower != 'false',
+                    reason="Can not reach Python packge index when isolated")
 def test_package_present():
     req = request.Request("https://pypi.python.org/pypi?:action=doap&name=check_docker", method="HEAD")
     with request.urlopen(req) as resp:
         assert resp.getcode() == 200
 
 
+@pytest.mark.skipif('isolated' in os.environ and os.environ['isolated'].lower != 'false',
+                    reason="Can not reach Python packge index when isolated")
 def test_ensure_new_version():
     version = cd.__version__
     req = request.Request("https://pypi.python.org/pypi?:action=doap&name=check_docker&version={version}".
@@ -747,11 +813,20 @@ def test_get_digest_from_registry_no_auth(check_docker):
         assert digest == "test_token"
 
 
+def test_get_digest_from_registry_missing_digest(check_docker):
+    response = FakeHttpResponse(content=b"", http_code=401, headers={
+        'Www-Authenticate': 'Bearer realm="https://example.com/token",service="example.com",scope="repository:test:pull"'})
+
+    with patch('check_docker.head_url', return_value=response), \
+         patch('check_docker.get_manifest_auth_token', return_value='test_token'):
+        with pytest.raises(check_docker.RegistryError):
+            check_docker.get_digest_from_registry('https://example.com/v2/test/manifests/lastest')
+
+
 @pytest.mark.parametrize('local_container_digest,registry_container_digest, image_urls, expected_rc', (
         ('AAAA', 'AAAA', ('example.com/foo',), cd.OK_RC),
         ('AAAA', 'BBBB', ('example.com/foo',), cd.CRITICAL_RC),
         (None, '', ('example.com/foo',), cd.UNKNOWN_RC),
-        ('', None, ('example.com/foo',), cd.UNKNOWN_RC),
         ('AAAA', 'AAAA', ('example.com/foo', 'example.com/bar'), cd.UNKNOWN_RC),
         ('AAAA', 'AAAA', tuple(), cd.UNKNOWN_RC),
 ))
@@ -761,3 +836,65 @@ def test_check_version(check_docker, local_container_digest, registry_container_
          patch('check_docker.get_digest_from_registry', return_value=registry_container_digest):
         check_docker.check_version('container', tuple())
         assert check_docker.rc == expected_rc
+
+
+
+def test_check_version_missing_digest(check_docker):
+    with patch('check_docker.get_container_digest', return_value='AAA'), \
+         patch('check_docker.get_container_image_urls', return_value=('example.com/foo',)), \
+         patch('check_docker.get_digest_from_registry', side_effect=check_docker.RegistryError(response=None)):
+        check_docker.check_version('container', tuple())
+        assert check_docker.rc == cd.UNKNOWN_RC
+
+
+def test_check_version_not_tls(check_docker):
+    class Reason():
+        reason = 'UNKNOWN_PROTOCOL'
+
+    exception = URLError(reason=Reason)
+    with patch('check_docker.get_container_digest', return_value='AAA'), \
+         patch('check_docker.get_container_image_urls', return_value=('example.com/foo',)), \
+         patch('check_docker.get_digest_from_registry', side_effect=exception):
+        check_docker.check_version('container', tuple())
+        assert check_docker.rc == cd.UNKNOWN_RC
+        assert 'TLS error' in check_docker.messages[0]
+
+def test_check_version_no_such_host(check_docker):
+    class Reason():
+        strerror = 'nodename nor servname provided, or not known'
+    exception = URLError(reason=Reason)
+    with patch('check_docker.get_container_digest', return_value='AAA'), \
+         patch('check_docker.get_container_image_urls', return_value=('example.com/foo',)), \
+         patch('check_docker.get_digest_from_registry', side_effect=exception):
+        check_docker.check_version('container', tuple())
+        assert check_docker.rc == cd.UNKNOWN_RC
+        assert 'Cannot reach registry' in check_docker.messages[0]
+
+def test_check_version_exception(check_docker):
+    # Unhandled exceptions should be passed on
+    exception = URLError(reason=None)
+    with patch('check_docker.get_container_digest', return_value='AAA'), \
+         patch('check_docker.get_container_image_urls', return_value=('example.com/foo',)), \
+         patch('check_docker.get_digest_from_registry', side_effect=exception),\
+         pytest.raises(URLError):
+        check_docker.check_version('container', tuple())
+
+@pytest.mark.parametrize('names', (
+        (('\\a', 'a\\b'),),
+        (('\\a'),),
+        (('a\\b', '\\a'),)
+))
+def test_get_ps_name_ok(check_docker, names):
+    ps_name = check_docker.get_ps_name(names)
+    assert ps_name == 'a'
+
+
+@pytest.mark.parametrize('names', (
+        ('a\\b'),
+        set(),
+        ('a\\b', 'b\\a'),
+        ('\\b', '\\a'),
+))
+def test_get_ps_name_ok(check_docker, names):
+    with pytest.raises(NameError):
+        check_docker.get_ps_name(names)
